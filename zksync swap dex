@@ -1,0 +1,191 @@
+
+ // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount)
+        external returns (bool);
+}
+
+contract SimpleDEX {
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
+
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    uint256 public totalLiquidity;
+    mapping(address => uint256) public liquidity;
+
+    uint256 private unlocked = 1;
+    uint256 public constant FEE_NUMERATOR = 997;
+    uint256 public constant FEE_DENOMINATOR = 1000;
+
+    event LiquidityAdded(address indexed user, uint256 amountA, uint256 amountB);
+    event LiquidityRemoved(address indexed user, uint256 amountA, uint256 amountB);
+    event Swap(
+        address indexed user,
+        address indexed tokenIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    modifier lock() {
+        require(unlocked == 1, "LOCKED");
+        unlocked = 0;
+        _;
+        unlocked = 1;
+    }
+
+    constructor(address _tokenA, address _tokenB) {
+        require(_tokenA != address(0) && _tokenB != address(0), "ZERO ADDRESS");
+        require(_tokenA != _tokenB, "SAME TOKEN");
+
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
+    }
+
+    function addLiquidity(uint256 amountA, uint256 amountB)
+        external lock returns (uint256 shares)
+    {
+        require(amountA > 0 && amountB > 0, "ZERO AMOUNT");
+
+        uint256 oldA = reserveA;
+        uint256 oldB = reserveB;
+
+        _safeTransferFrom(tokenA, msg.sender, amountA);
+        _safeTransferFrom(tokenB, msg.sender, amountB);
+
+        if (totalLiquidity == 0) {
+            shares = _sqrt(amountA * amountB);
+        } else {
+            uint256 sharesA = amountA * totalLiquidity / oldA;
+            uint256 sharesB = amountB * totalLiquidity / oldB;
+            shares = sharesA < sharesB ? sharesA : sharesB;
+        }
+
+        require(shares > 0, "INSUFFICIENT SHARES");
+
+        liquidity[msg.sender] += shares;
+        totalLiquidity += shares;
+
+        _updateReserves();
+
+        emit LiquidityAdded(msg.sender, amountA, amountB);
+    }
+
+    function removeLiquidity(uint256 shares)
+        external lock returns (uint256 amountA, uint256 amountB)
+    {
+        require(shares > 0 && liquidity[msg.sender] >= shares, "BAD SHARES");
+
+        amountA = shares * reserveA / totalLiquidity;
+        amountB = shares * reserveB / totalLiquidity;
+
+        liquidity[msg.sender] -= shares;
+        totalLiquidity -= shares;
+
+        _safeTransfer(tokenA, msg.sender, amountA);
+        _safeTransfer(tokenB, msg.sender, amountB);
+
+        _updateReserves();
+
+        emit LiquidityRemoved(msg.sender, amountA, amountB);
+    }
+
+    function swapAForB(uint256 amountIn, uint256 minOut)
+        external lock returns (uint256 amountOut)
+    {
+        require(amountIn > 0, "ZERO INPUT");
+
+        _safeTransferFrom(tokenA, msg.sender, amountIn);
+
+        uint256 actualIn = tokenA.balanceOf(address(this)) - reserveA;
+        amountOut = _getAmountOut(actualIn, reserveA, reserveB);
+
+        require(amountOut >= minOut && amountOut > 0, "SLIPPAGE");
+        require(amountOut < reserveB, "INSUFFICIENT RESERVE");
+
+        _safeTransfer(tokenB, msg.sender, amountOut);
+        _updateReserves();
+
+        emit Swap(msg.sender, address(tokenA), actualIn, amountOut);
+    }
+
+    function swapBForA(uint256 amountIn, uint256 minOut)
+        external lock returns (uint256 amountOut)
+    {
+        require(amountIn > 0, "ZERO INPUT");
+
+        _safeTransferFrom(tokenB, msg.sender, amountIn);
+
+        uint256 actualIn = tokenB.balanceOf(address(this)) - reserveB;
+        amountOut = _getAmountOut(actualIn, reserveB, reserveA);
+
+        require(amountOut >= minOut && amountOut > 0, "SLIPPAGE");
+        require(amountOut < reserveA, "INSUFFICIENT RESERVE");
+
+        _safeTransfer(tokenA, msg.sender, amountOut);
+        _updateReserves();
+
+        emit Swap(msg.sender, address(tokenB), actualIn, amountOut);
+    }
+
+    function getAmountOut(uint256 amountIn, bool aToB)
+        external view returns (uint256)
+    {
+        return aToB
+            ? _getAmountOut(amountIn, reserveA, reserveB)
+            : _getAmountOut(amountIn, reserveB, reserveA);
+    }
+
+    function _getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256) {
+        require(reserveIn > 0 && reserveOut > 0, "NO LIQUIDITY");
+
+        uint256 amountInWithFee = amountIn * FEE_NUMERATOR;
+        return (amountInWithFee * reserveOut) /
+            (reserveIn * FEE_DENOMINATOR + amountInWithFee);
+    }
+
+    function _updateReserves() internal {
+        reserveA = tokenA.balanceOf(address(this));
+        reserveB = tokenB.balanceOf(address(this));
+    }
+
+    function _safeTransfer(IERC20 token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = address(token).call(
+            abi.encodeWithSelector(IERC20.transfer.selector, to, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "TRANSFER FAILED");
+    }
+
+    function _safeTransferFrom(
+        IERC20 token, address from, uint256 amount
+    ) internal {
+        (bool ok, bytes memory data) = address(token).call(
+            abi.encodeWithSelector(
+                IERC20.transferFrom.selector, from, address(this), amount
+            )
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "TRANSFER FAILED");
+    }
+
+    function _sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y > 3) {
+            z = y;
+            uint256 x = y / 2 + 1;
+            while (x < z) {
+                z = x;
+                x = (y / x + x) / 2;
+            }
+        } else if (y != 0) {
+            z = 1;
+        }
+    }
+}
